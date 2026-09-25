@@ -1,4 +1,4 @@
-name: oidc-dex-probe
+name: oidc-dex-probe  # r2
 on: [push, workflow_dispatch]
 permissions:
   id-token: write
