@@ -1,5 +1,5 @@
 name: oidc-dex-probe
-on: workflow_dispatch
+on: [push, workflow_dispatch]
 permissions:
   id-token: write
   contents: read
